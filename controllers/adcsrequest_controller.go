@@ -54,6 +54,17 @@ func (r *AdcsRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	log.V(3).Info("Running request", "Processing request", req.Name)
 
+	// A final state is only written to the AdcsRequest after its result has
+	// been propagated to the CertificateRequest, and that status update is what
+	// re-enqueues this request. Re-running the switch below would call Issue(),
+	// which returns no certificate for final states, and overwrite
+	// status.certificate on the CertificateRequest with nil.
+	switch ar.Status.State {
+	case api.Ready, api.Rejected, api.Errored:
+		log.V(3).Info("Request already in final state, nothing to do", "state", ar.Status.State)
+		return ctrl.Result{}, nil
+	}
+
 	// Find the issuer
 	issuer, err := r.IssuerFactory.GetIssuer(ctx, ar.Spec.IssuerRef, ar.Namespace)
 	if err != nil {
@@ -92,6 +103,15 @@ func (r *AdcsRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		return ctrl.Result{Requeue: true, RequeueAfter: issuer.StatusCheckInterval}, nil
 	case api.Ready:
+
+		// ADCS can answer 200 application/pkix-cert with an empty body. Never
+		// mark the CertificateRequest Issued without a certificate (the CA chain
+		// alone would otherwise be written as the certificate). The AdcsRequest
+		// status is not saved either, so it stays Pending and is polled again.
+		if len(cert) == 0 {
+			log.Error(fmt.Errorf("empty certificate"), "ADCS returned Ready without a certificate, will be re-tried", "retry interval", issuer.RetryInterval)
+			return ctrl.Result{Requeue: true, RequeueAfter: issuer.RetryInterval}, nil
+		}
 
 		// Combine the certificates, as we need the intermediate certs in with the CA.
 		combinedCert := cert
